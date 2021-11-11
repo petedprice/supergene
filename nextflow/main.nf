@@ -1,20 +1,15 @@
-reads_ch = Channel.fromFilePairs(params.reads + '/**/*{1,2}.fastq.gz')
-reads_ch2 = Channel.fromPath(params.reads + '/**/*.fastq.gz')
-meta_path = Channel.fromPath(params.metadata)
-adapter=file(params.adapter)
+reads_ch = Channel.fromFilePairs(params.reads + '/*{1,2}.fastq.gz')
+gtf=file(params.gtf)
+ref=file(params.ref)
 metadata=file(params.metadata)
-
-
-cdna_ch=Channel.fromPath(params.cdna + '/*.gz')
-cds_ch=Channel.fromPath(params.cds + '/*.gz')
-
-
+adapter=file(params.adapter)
+//targetsnps=params.targetsnps
 
 ref_ch=channel
     .fromPath(metadata)
     .splitCsv()
     .map {row ->tuple(row[0],row[1])}
- 
+
 
 process trim {
 
@@ -44,25 +39,33 @@ process trim {
 }
 
 process index_star {
-    input: 
-    file(ref) from reference
-    file(gtf) from annotation
+
+    cpus = 8
+    memory = '40 GB'
+    time = '2h'
+
+    tag {'star index'}
+
+
+    publishDir 'index', mode: 'copy', overwrite: true, pattern: '*'
 
     output:
-
+    file('star_index') into star_indexed
 
 
     script:
     """
     #!/bin/bash
     source /usr/local/extras/Genomics/.bashrc
+    mkdir star_index
     source activate star
-    STAR --runThreadN 6 \
+    STAR --runThreadN 32 \
 	--runMode genomeGenerate \
 	--genomeDir star_index \
-	--genomeFastaFiles ref \
-	--sjdbGTFfile gtf \
-	--sjdbOverhang 99    
+	--genomeFastaFiles $ref \
+	--sjdbGTFfile $gtf \
+	--sjdbOverhang 99 \
+	--genomeSAindexNbases 13
 
     """
 
@@ -74,12 +77,16 @@ process index_star {
 process allignment_star {
     
 
+    cpus = 4
+    memory = '16 GB'
+    time = '2h'
+
     input:
     tuple val(species), val(sid), file("${species}_${sid}_forward_paired.fastq.gz"), file("${species}_${sid}_reverse_paired.fastq.gz") from trimmed2
-
+    file('star_index') from star_indexed
 
     output:
-    
+    tuple val(sid), file("star_alligned_${sid}") into alligned     
 
     script: 
     """
@@ -87,12 +94,61 @@ process allignment_star {
     source /usr/local/extras/Genomics/.bashrc
     source activate star
     STAR --genomeDir star_index/ \
-	--runThreadN 6 \
-	--readFilesIn xxxxxx \
+	--runThreadN 8 \
+	--readFilesIn ${species}_${sid}_forward_paired.fastq.gz ${species}_${sid}_reverse_paired.fastq.gz \
 	--outFileNamePrefix star_alligned_${sid} \
 	--outSAMtype BAM SortedByCoordinate \
 	--outSAMunmapped Within \
-	--outSAMattributes Standard
+	--outSAMattributes Standard \
+	--quantMode GeneCounts
     """
 
 }
+
+process snp_calling {
+
+
+    input:
+    tuple val(sid), file("star_alligned_${sid}") from alligned
+
+
+    output:
+
+
+    script:
+    """
+    source /usr/local/extras/Genomics/.bashrc
+    gatk --java-options "-Xmx4g" HaplotypeCaller \
+	-R $ref \
+	-I input.bam \
+	-O ${sid}.vcf.gz \
+	-ERC GVCF
+    """
+
+}
+
+/*
+
+process allele_quant {
+
+
+    input:
+    tuple val(sid), file("star_alligned_${sid}") from alligned
+
+    output:
+
+
+    script:
+    """
+    source /usr/local/extras/Genomics/.bashrc
+    gatk ASEReadCounter \ 
+	-R $ref \ 
+	-I ${sid}.bam \ 
+	-V targetsites.vcf.gz \ 
+	-O ${sid}_allele_counts.table
+    """
+
+}
+
+
+*/

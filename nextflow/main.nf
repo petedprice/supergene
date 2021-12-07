@@ -1,6 +1,7 @@
 reads_ch = Channel.fromFilePairs(params.reads + '/*{1,2}.fastq.gz')
 gtf=file(params.gtf)
 ref=file(params.ref)
+ref_index=file(params.ref_index)
 metadata=file(params.metadata)
 adapter=file(params.adapter)
 //targetsnps=params.targetsnps
@@ -13,6 +14,9 @@ ref_ch=channel
 
 process trim {
 
+
+    queue = "ressexcon.q"
+    clusterOptions = { '-P ressexcon' }
     cpus = 4
     memory = '8 GB'
     time = '2h'
@@ -38,35 +42,57 @@ process trim {
     """
 }
 
-process index_star {
 
-    cpus = 8
-    memory = '40 GB'
-    time = '2h'
+process prep {
 
-    tag {'star index'}
-
-
-    publishDir 'index', mode: 'copy', overwrite: true, pattern: '*'
 
     output:
-    file('star_index') into star_indexed
+    tuple file('genome.ss'), file('genome.exon') into prepped
+    tuple file('genome.ss'), file('genome.exon') into prepped2
 
 
     script:
     """
     #!/bin/bash
     source /usr/local/extras/Genomics/.bashrc
-    mkdir star_index
-    source activate star
-    STAR --runThreadN 32 \
-	--runMode genomeGenerate \
-	--genomeDir star_index \
-	--genomeFastaFiles $ref \
-	--sjdbGTFfile $gtf \
-	--sjdbOverhang 99 \
-	--genomeSAindexNbases 13
+    hisat2_extract_splice_sites.py $gtf > genome.ss
+    hisat2_extract_exons.py $gtf > genome.exon
+    """
 
+}
+
+
+
+
+process index_hisat2 {
+
+    queue = "ressexcon.q"
+    cpus = 16
+    memory = '192 GB'
+    time = '1h'
+    clusterOptions = { '-P ressexcon' }
+
+    
+    tag {'hisat index'}
+
+
+    publishDir 'index', mode: 'copy', overwrite: true, pattern: '*'
+
+    input:
+    tuple file('genome.ss'), file('genome.exon') from prepped
+
+    output:
+    file('hisat_index') into hisat_indexed
+
+
+    script:
+    """
+    #!/bin/bash
+    source /usr/local/extras/Genomics/.bashrc
+    ##hisat2-build --exon genome.exon --ss genome.ss $ref index -p 16
+    hisat2-build $ref index -p 16
+    mkdir hisat_index
+    mv index*ht2 hisat_index
     """
 
 
@@ -74,81 +100,135 @@ process index_star {
 }
 
 
-process allignment_star {
+process allignment_hisat2 {
+    
+    tag {'allign_' + '_' + sid }
+
+    queue = "ressexcon.q"
+    cpus = 4
+    memory = '8 GB'
+    time = '4h'
+    clusterOptions = { '-P ressexcon' }
     
 
-    cpus = 4
-    memory = '16 GB'
-    time = '2h'
+    publishDir 'bam', mode: 'copy', overwrite: true, pattern: '*bam'
 
     input:
     tuple val(species), val(sid), file("${species}_${sid}_forward_paired.fastq.gz"), file("${species}_${sid}_reverse_paired.fastq.gz") from trimmed2
-    file('star_index') from star_indexed
+    file('hisat_index') from hisat_indexed
+    tuple file('genome.ss'), file('genome.exon') from prepped2
 
     output:
-    tuple val(sid), file("star_alligned_${sid}") into alligned     
+    tuple val(sid), file("${sid}.bam") into alligned1
+    tuple val(sid), file("${sid}.bam") into alligned2     
 
     script: 
     """
     #!/bin/bash
     source /usr/local/extras/Genomics/.bashrc
-    source activate star
-    STAR --genomeDir star_index/ \
-	--runThreadN 8 \
-	--readFilesIn ${species}_${sid}_forward_paired.fastq.gz ${species}_${sid}_reverse_paired.fastq.gz \
-	--outFileNamePrefix star_alligned_${sid} \
-	--outSAMtype BAM SortedByCoordinate \
-	--outSAMunmapped Within \
-	--outSAMattributes Standard \
-	--quantMode GeneCounts
+    hisat2 \
+	-x hisat_index/index \
+	-1 ${species}_${sid}_forward_paired.fastq.gz \
+	-2 ${species}_${sid}_reverse_paired.fastq.gz \
+        --known-splicesite-infile genome.ss \
+        --summary-file ${sid}_hisat2.summary.log \
+        --threads 16 \
+            | samtools view -bS -F 4 -F 8 -F 256 - > ${sid}.bam
     """
 
 }
+
+process RG_add {
+    errorStrategy 'ignore'
+
+    tag {'RG_' + '_' + sid }
+
+    queue = "ressexcon.q"
+    clusterOptions = { '-P ressexcon' }
+
+    cpus = 4
+    memory = '8 GB'
+    time = '2h'
+
+    input:
+    tuple val(sid), file("${sid}.bam") from alligned1
+
+    output:
+    tuple val(sid), file("${sid}.RG.bam") into readgrouped1
+    tuple val(sid), file("${sid}.RG.bam") into readgrouped2
+
+    script:
+    """
+    #!/bin/bash
+    source /usr/local/extras/Genomics/.bashrc
+    source activate gatk
+    picard AddOrReplaceReadGroups I=${sid}.bam O=${sid}.RG.bam SORT_ORDER=coordinate RGID=zf RGLB=zf RGPL=illumina RGSM=zf RGPU=zf CREATE_INDEX=True
+    """
+
+}
+
+
 
 process snp_calling {
+    errorStrategy 'ignore'
 
+    tag {'haplotypecaller_' + '_' + sid }
+
+
+    queue = "ressexcon.q"
+    clusterOptions = { '-P ressexcon' }
+    cpus = 2
+    memory = '4 GB'
+    time = '2h'
 
     input:
-    tuple val(sid), file("star_alligned_${sid}") from alligned
-
+    tuple val(sid), file("${sid}.RG.bam") from readgrouped1
+    file('ref.fasta') from ref
+    file('ref.fasta.fai') from ref_index
 
     output:
-
+   
 
     script:
     """
+    #!/bin/bash
     source /usr/local/extras/Genomics/.bashrc
+
+    source activate gatk 
+
+    samtools faidx ref.fasta
+
+    picard CreateSequenceDictionary R=ref.fasta O=ref.dict
+
     gatk --java-options "-Xmx4g" HaplotypeCaller \
-	-R $ref \
-	-I input.bam \
-	-O ${sid}.vcf.gz \
-	-ERC GVCF
+        -R ref.fasta \
+        -I ${sid}.RG.bam \
+        -O ${sid}.vcf.gz \
+       	-ERC GVCF
     """
 
 }
 
-/*
-
-process allele_quant {
-
+process featureCounts { 
+    errorStrategy 'ignore'
+    tag {'featurecount_' + '_' + sid }
 
     input:
-    tuple val(sid), file("star_alligned_${sid}") from alligned
+    tuple val(sid), file("${sid}.RG.bam") from readgrouped2
 
     output:
 
 
     script:
     """
+    #!/bin/bash
     source /usr/local/extras/Genomics/.bashrc
-    gatk ASEReadCounter \ 
-	-R $ref \ 
-	-I ${sid}.bam \ 
-	-V targetsites.vcf.gz \ 
-	-O ${sid}_allele_counts.table
+
+    source activate subread
+
+
+
     """
 
 }
 
-
-*/
